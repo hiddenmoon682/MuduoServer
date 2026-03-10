@@ -1021,7 +1021,7 @@ public:
     Any():_content(nullptr) {}
 
     template<class T>
-    Any(const T& val):_content(new placeholder(_val)) {}
+    Any(const T& val):_content(new placeholder<T>(val)) {}
 
     Any(const Any& other):_content(other._content ? other._content->clone() : nullptr) {}
 
