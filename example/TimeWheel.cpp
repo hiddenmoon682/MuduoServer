@@ -8,7 +8,6 @@
 
 using TaskFunc = std::function<void()>;
 using ReleaseFunc = std::function<void()>;
-
 class TimerTask
 {
 private:
