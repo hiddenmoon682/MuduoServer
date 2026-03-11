@@ -518,7 +518,7 @@ private:
         // op 是控制增加/删除...操作
         int ret = epoll_ctl(_epfd, op, fd, &ev);
         if (ret < 0)
-            ERR_LOG("EPOLLCTL FAILED!");
+                ERR_LOG("EPOLLCTL FAILED! fd=%d, op=%d, events=%d, error=%s", fd, op, channel->Events(), strerror(errno));
         
         return;
     }
@@ -969,27 +969,27 @@ public:
 
 // 在这里实现避免前向声明的EventLoop类无法调用对应的方法
 // 移除事件监控
-void Channel::Remove() { return _loop->RemoveEvent(this); }
+inline void Channel::Remove() { return _loop->RemoveEvent(this); }
 // 更新事件监控
-void Channel::Update() { return _loop->UpdateEvent(this); }
+inline void Channel::Update() { return _loop->UpdateEvent(this); }
 
 // 添加定时任务
-void TimerWheel::TimerAdd(uint64_t id, uint32_t delay, const TaskFunc& cb)
+inline void TimerWheel::TimerAdd(uint64_t id, uint32_t delay, const TaskFunc& cb)
 {
     _loop->RunInLoop(std::bind(&TimerWheel::TimerAddInLoop, this, id, delay, cb));
 }
 
 // // 刷新/延迟任务
-void TimerWheel::TimerRefresh(uint64_t id)
+inline void TimerWheel::TimerRefresh(uint64_t id)
 {
     _loop->RunInLoop(std::bind(&TimerWheel::TimerRefreshInLoop, this, id));
 }
 
-void TimerWheel::TimerCancel(uint64_t id)
+inline void TimerWheel::TimerCancel(uint64_t id)
 {
     _loop->RunInLoop(std::bind(&TimerWheel::TimerCancelInLoop, this, id));
 }
-
+    
 // 仿照实现std::any类, 用于保存上下文信息
 class Any
 {
@@ -1355,4 +1355,54 @@ public:
         _loop->AssertInLoop();
         _loop->RunInLoop(std::bind(&Connection::UpgradeInLoop, this, context, conn, msg, closed, event));
     }
+};
+
+class Acceptor
+{
+private:
+    Socket _socket;     // 监听套接字
+    EventLoop* _loop;   // 事件循环
+    Channel _channel;   // 套接字的事件管理
+
+    using AcceptCallback = std::function<void(int)>;
+    AcceptCallback _accept_callback;
+
+private:
+    // 处理新连接事件--获取新连接，调用回调函数
+    void HandleAccept()
+    {
+        int connfd = _socket.Accept();
+        if(connfd < 0)
+        {
+            ERR_LOG("ACCEPT FAILED!");
+            return;
+        }
+        if (_accept_callback) _accept_callback(connfd);
+    }
+
+    // 创建服务器套接字--绑定端口，监听
+    int CreateServer(int port)
+    {
+        bool ret = _socket.CreateServer(port);
+        if(!ret)
+        {
+            ERR_LOG("CREATE SERVER FAILED!");
+            return -1;
+        }
+        return _socket.Fd();
+    }
+
+public:
+    // 构造函数--创建服务器套接字，绑定端口，监听端口
+    Acceptor(EventLoop* loop, int port)
+        :_loop(loop), _socket(CreateServer(port)), _channel(loop, _socket.Fd())
+    {
+        _channel.SetReadCallback(std::bind(&Acceptor::HandleAccept, this));
+    }
+
+    // 设置新连接回调函数
+    void SetAcceptCallback(const AcceptCallback& cb) { _accept_callback = cb; }
+
+    // 启动监听--开启读事件监控，等待新连接
+    void Listen() { _channel.EnableRead(); }
 };
