@@ -23,15 +23,24 @@
 #define INF 0
 #define DBG 1
 #define ERR 2
-#define LOG_LEVEL DBG
+#define LOG_LEVEL INF
 
-#define LOG(level, format, ...) do{\
-        if (level < LOG_LEVEL) break;\
-        time_t t = time(NULL);\
-        struct tm *ltm = localtime(&t);\
-        char tmp[32] = {0};\
-        strftime(tmp, 31, "%H:%M:%S", ltm);\
-        fprintf(stdout, "[%p %s %s:%d] " format "\n", (void*)pthread_self(), tmp, __FILE__, __LINE__, ##__VA_ARGS__);\
+static const char* log_level_name(int level) {
+    switch(level) {
+        case INF: return "INF";
+        case DBG: return "DBG";
+        case ERR: return "ERR";
+        default: return "UNKNOWN";
+    }
+};
+
+#define LOG(level, format, ...) do{     \
+        if (level < LOG_LEVEL) break;   \
+        time_t t = time(NULL);      \
+        struct tm *ltm = localtime(&t); \
+        char tmp[32] = {0}; \
+        strftime(tmp, 31, "%H:%M:%S", ltm); \
+        fprintf(stdout, "[%p %s %s:%d %s] " format "\n", (void*)pthread_self(), tmp, __FILE__, __LINE__, log_level_name(level), ##__VA_ARGS__); \
     }while(0)
 
 #define INF_LOG(format, ...) LOG(INF, format, ##__VA_ARGS__)
@@ -959,11 +968,55 @@ public:
     {
         EventLoop* loop = NULL;
         {
-            std::unique_lock<std::mutex> lock(_mutex);// 加速
+            std::unique_lock<std::mutex> lock(_mutex);// 加锁
             _cond.wait(lock, [&](){ return _loop != NULL; });// loop为NULL就一直阻塞
             loop = _loop;
         }
         return loop;
+    }
+};
+
+class LoopThreadPool
+{
+private:
+    int _thread_count;                    // 线程数量
+    int _next_id;                         // 下一个线程ID
+    EventLoop* _baseloop;                 // 基础事件循环
+    std::vector<LoopThread*> _threads;    // 事件循环线程池
+    std::vector<EventLoop*> _loops;       // 事件循环指针数组
+public:
+    LoopThreadPool(EventLoop* baseloop)
+        :_thread_count(0),
+        _next_id(0),
+        _baseloop(baseloop)
+    {}
+
+    void SetThreadCount(int thread_count)
+    {
+        _thread_count = thread_count;
+    }
+
+    // 创建线程池
+    void Create()
+    {
+        if(_thread_count > 0) {
+            _threads.resize(_thread_count);
+            _loops.resize(_thread_count);
+            for(int i = 0; i < _thread_count; ++i) {
+                _threads[i] = new LoopThread();
+                _loops[i] = _threads[i]->GetLoop();
+            }
+        }
+    }
+
+    // 获取下一个EventLoop对象指针
+    EventLoop* NextLoop()
+    {
+        if(_thread_count == 0) {
+            return _baseloop;
+        }
+        _next_id = (_next_id + 1) % _thread_count;
+        return _loops[_next_id];
     }
 };
 
@@ -1318,6 +1371,7 @@ public:
         // 因此有可能在执行的时候，data指向的空间有可能已经被释放了，所以这里先定义一个buffer
         Buffer buf;
         buf.WriteAndPush(data, len);
+
         // std::move直接将资源转移
         _loop->RunInLoop(std::bind(&Connection::SendInLoop, this, std::move(buf)));
     }
@@ -1405,4 +1459,111 @@ public:
 
     // 启动监听--开启读事件监控，等待新连接
     void Listen() { _channel.EnableRead(); }
+};
+
+class TcpServer
+{
+private:
+    uint64_t _next_id;              // 连接唯一标识符
+    int _port;                      // 端口号
+    int _timeout;                   // 非活跃连接的超时时间 单位：秒
+    bool _enable_inactive_release;  // 是否启用非活跃连接销毁
+
+    EventLoop _baseloop;                                 // 事件循环
+    Acceptor _acceptor;                                  // 监听套接字管理
+    std::unordered_map<uint64_t, PtrConnection> _conns;  // 连接管理
+    LoopThreadPool _loop_pool;                           // 事件循环线程池
+
+    using ConnectedCallback = std::function<void(const PtrConnection&)>;
+    using MessageCallback = std::function<void(const PtrConnection&, Buffer*)>;
+    using ClosedCallback = std::function<void(const PtrConnection&)>;
+    using AnyEventCallback = std::function<void(const PtrConnection&)>;
+    using Functor = std::function<void()>;
+    ConnectedCallback _connected_callback;
+    MessageCallback _message_callback;
+    ClosedCallback _closed_callback;
+    AnyEventCallback _event_callback;
+
+private:
+    // 在事件循环线程中延迟执行任务
+    void RunAfterInLoop(const Functor& task, int delay)
+    {
+        _next_id++;
+        _baseloop.TimerAdd(_next_id, delay, task);
+    }
+
+    // 在事件循环线程中创建新连接
+    void NewConnection(int newfd)
+    {
+        _next_id++;
+        // 从线程池获取下一个事件循环对象指针
+        PtrConnection new_conn = std::make_shared<Connection>(_loop_pool.NextLoop(), _next_id, newfd);
+        INF_LOG("GET NEW CONNECTION");
+
+        new_conn->SetConnectedCallback(_connected_callback);
+        new_conn->SetMessageCallback(_message_callback);
+        new_conn->SetClosedCallback(_closed_callback);
+        new_conn->SetAnyEventCallback(_event_callback);
+        new_conn->SetSrvClosedCallback(std::bind(&TcpServer::RemoveConnection, this, std::placeholders::_1));
+        if(_enable_inactive_release) new_conn->EnableInactiveRelease(_timeout);
+        new_conn->Established();    // 连接建立--开启读事件监控
+
+        _conns.insert(std::make_pair(_next_id, new_conn));
+    }
+
+    // 删除连接
+    void RemoveConnectionInLoop(const PtrConnection& conn)
+    {
+        int id = conn->Id();
+        auto it = _conns.find(id);
+        if(it != _conns.end()) {
+            _conns.erase(it);
+        }
+    }
+
+    // 在事件循环线程中删除连接
+    void RemoveConnection(const PtrConnection& conn)
+    {
+        _baseloop.RunInLoop(std::bind(&TcpServer::RemoveConnectionInLoop, this, conn));
+    }
+
+public:
+    TcpServer(int port)
+        :_port(port),
+        _next_id(0),
+        _enable_inactive_release(false),
+        _acceptor(&_baseloop, port),
+        _loop_pool(&_baseloop)
+    {
+        _acceptor.SetAcceptCallback(std::bind(&TcpServer::NewConnection, this, std::placeholders::_1));
+        _acceptor.Listen();
+    }
+
+    void SetThreadCount(int thread_count)
+    {
+        _loop_pool.SetThreadCount(thread_count);
+    }
+
+    void SetConnectedCallback(const ConnectedCallback& cb) { _connected_callback = cb; }
+    void SetMessageCallback(const MessageCallback& cb) { _message_callback = cb; }
+    void SetClosedCallback(const ClosedCallback& cb) { _closed_callback = cb; }
+    void SetAnyEventCallback(const AnyEventCallback& cb) { _event_callback = cb; }
+
+    // 启用非活跃连接销毁
+    void EnableInactiveRelease(int timeout)
+    {
+        _enable_inactive_release = true;
+        _timeout = timeout;
+    }
+
+    void RunAfter(const Functor& task, int delay)
+    {
+        _baseloop.RunInLoop(std::bind(&TcpServer::RunAfterInLoop, this, task, delay));
+    }
+
+    void Start()
+    {
+        _loop_pool.Create();
+        _baseloop.Start();
+    }
 };
